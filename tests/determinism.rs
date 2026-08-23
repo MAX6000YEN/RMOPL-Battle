@@ -69,7 +69,9 @@ fn sqrt_is_bit_stable() {
 ///
 /// If this value changes, something changed the meaning of a tick. That is
 /// sometimes intentional, and it is never something to update without knowing
-/// why.
+/// why. It has moved once so far: spawn insertion was reordered when the
+/// ordering key stopped being a hash of the spawn's fields and became the
+/// fields themselves, which changed which entity got which id.
 #[test]
 fn a_recorded_match_replays_to_the_same_checksum() {
     use rmopl::ids::PlayerId;
@@ -113,5 +115,5 @@ fn a_recorded_match_replays_to_the_same_checksum() {
 
     assert_eq!(sim.tick().get(), 600);
     assert_eq!(sim.entity_count(), 48);
-    assert_eq!(sim.state_hash(), 2_864_514_947_282_321_901);
+    assert_eq!(sim.state_hash(), 11_755_374_171_786_398_137);
 }

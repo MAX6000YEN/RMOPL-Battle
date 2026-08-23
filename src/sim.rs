@@ -131,7 +131,8 @@ pub struct Spawn {
 }
 
 impl Spawn {
-    /// The key insertion is ordered by.
+    /// The key insertion is ordered by: every field, in a fixed order,
+    /// compared as raw bits.
     ///
     /// Derived from *what is being spawned*, never from when the request
     /// arrived or from a counter. That distinction is the whole point: a
@@ -140,22 +141,23 @@ impl Spawn {
     /// would build different worlds — and sorting afterwards would not save
     /// them, because the ids were already wrong before the sort ran.
     ///
-    /// Content-derived keys can collide, and a collision is harmless here: two
-    /// requests with the same key describe entities identical in every field,
-    /// so whichever order they land in produces the same world. The sort is
-    /// stable, so they keep their arrival order rather than swapping about.
-    fn sort_key(&self) -> u64 {
-        let owner = match self.owner {
-            // Distinguished from `Some`, so an unowned spawn at the origin and
-            // a spawn owned by player zero are never the same key.
-            None => u64::MAX,
-            Some(player) => u64::from(player.raw()),
-        };
-        fnv1a(&[
-            self.position.x.to_bits() as u64,
-            self.position.y.to_bits() as u64,
-            owner,
-        ])
+    /// This is a total order over the fields rather than a hash of them, and
+    /// the difference matters. A hash is not injective: two spawns that differ
+    /// somewhere can still land on the same 64-bit value, and the sort would
+    /// then leave them in whatever order they arrived in — which is the very
+    /// dependence the key exists to remove, reintroduced in the one case
+    /// nobody would think to test. Comparing the fields themselves cannot
+    /// collide, so two keys are equal only when every field is equal, and such
+    /// spawns really are interchangeable.
+    ///
+    /// `Option` orders `None` before `Some`, so an unowned spawn and one owned
+    /// by player zero are distinct here rather than needing a sentinel.
+    fn order_key(&self) -> (i64, i64, Option<PlayerId>) {
+        (
+            self.position.x.to_bits(),
+            self.position.y.to_bits(),
+            self.owner,
+        )
     }
 }
 
@@ -255,9 +257,10 @@ impl Sim {
             return;
         }
 
-        // Stable, so equal keys keep their arrival order rather than being
-        // permuted by the sort's internal choices.
-        self.pending.sort_by_key(Spawn::sort_key);
+        // Equal keys now mean spawns identical in every field, so how the sort
+        // arranges them among themselves cannot be observed and stability buys
+        // nothing.
+        self.pending.sort_unstable_by_key(Spawn::order_key);
         for spawn in self.pending.drain(..) {
             self.entities.insert(Entity {
                 position: spawn.position,
@@ -579,19 +582,82 @@ mod tests {
         assert_eq!(forwards_ids, backwards_ids);
     }
 
-    /// An unowned spawn at the origin and one owned by player zero are
-    /// different things and must not share an ordering key.
+    /// Two spawns share an ordering key only when they are equal in every
+    /// field. A hash could not promise this, and a collision between distinct
+    /// spawns would silently hand the tie back to arrival order.
     #[test]
-    fn ownership_is_part_of_the_ordering_key() {
-        let unowned = Spawn {
+    fn only_identical_spawns_share_an_ordering_key() {
+        let base = Spawn {
             position: FVec2::ZERO,
             owner: None,
         };
-        let owned = Spawn {
-            position: FVec2::ZERO,
-            owner: Some(PlayerId::new(0)),
-        };
-        assert_ne!(unowned.sort_key(), owned.sort_key());
+        let variants = [
+            base,
+            Spawn {
+                owner: Some(PlayerId::new(0)),
+                ..base
+            },
+            Spawn {
+                owner: Some(PlayerId::new(1)),
+                ..base
+            },
+            Spawn {
+                position: FVec2::new(Fix::from_bits(1), Fix::ZERO),
+                ..base
+            },
+            Spawn {
+                position: FVec2::new(Fix::ZERO, Fix::from_bits(1)),
+                ..base
+            },
+            Spawn {
+                position: FVec2::new(Fix::from_bits(-1), Fix::ZERO),
+                ..base
+            },
+        ];
+
+        for (i, a) in variants.iter().enumerate() {
+            for (j, b) in variants.iter().enumerate() {
+                assert_eq!(
+                    a.order_key() == b.order_key(),
+                    i == j,
+                    "variants {i} and {j} disagree"
+                );
+            }
+        }
+
+        // Identical spawns do share one, which is what makes them safe to
+        // reorder.
+        assert_eq!(base.order_key(), base.order_key());
+    }
+
+    /// The ordering must be a total order: consistent, and never dependent on
+    /// which of the two happens to be asked first.
+    #[test]
+    fn the_ordering_is_antisymmetric_and_transitive() {
+        let spawns = [
+            spawn_at("-1", "5"),
+            spawn_at("-1", "-5"),
+            spawn_at("0", "0"),
+            spawn_at("3.25", "0"),
+            Spawn {
+                position: FVec2::ZERO,
+                owner: Some(PlayerId::new(2)),
+            },
+        ];
+
+        for a in &spawns {
+            for b in &spawns {
+                assert_eq!(
+                    a.order_key().cmp(&b.order_key()),
+                    b.order_key().cmp(&a.order_key()).reverse()
+                );
+                for c in &spawns {
+                    if a.order_key() <= b.order_key() && b.order_key() <= c.order_key() {
+                        assert!(a.order_key() <= c.order_key());
+                    }
+                }
+            }
+        }
     }
 
     #[test]
