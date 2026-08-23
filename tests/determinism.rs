@@ -69,17 +69,42 @@ fn sqrt_is_bit_stable() {
 ///
 /// If this value changes, something changed the meaning of a tick. That is
 /// sometimes intentional, and it is never something to update without knowing
-/// why. It has moved once so far: spawn insertion was reordered when the
-/// ordering key stopped being a hash of the spawn's fields and became the
-/// fields themselves, which changed which entity got which id.
+/// why. It has moved twice so far.
+///
+/// Once when spawn insertion was reordered: the ordering key stopped being a
+/// hash of the spawn's fields and became the fields themselves, which changed
+/// which entity got which id.
+///
+/// Once when gravity, platforms and grounding arrived. Entities gained
+/// velocities, a rotation, a scale, a platform shape and grounded state, all of
+/// which are hashed; and the bodies in this replay now fall, land on the
+/// platform below them, and stay there. The replay is no longer only testing
+/// that spawn ordering is stable — it exercises the fall curve, the ground
+/// raycasts and the surface positions on every one of its six hundred ticks.
 #[test]
 fn a_recorded_match_replays_to_the_same_checksum() {
     use rmopl::ids::PlayerId;
     use rmopl::input::ActionState;
+    use rmopl::platform::{PlatformKind, PlatformShape};
     use rmopl::sim::{Sim, Spawn};
 
     let mut sim = Sim::new(0x1234_5678_9abc_def0);
     let mut inputs = Vec::new();
+
+    // Two platforms, one of them rotated, wide enough that some of the bodies
+    // spawned below land on them and the rest fall past.
+    for (x, y, half_width, rotation) in [("0", "-30", "40", "0"), ("30", "-12", "8", "0.35")] {
+        sim.request_spawn(Spawn {
+            position: FVec2::new(Fix::lit(x), Fix::lit(y)),
+            rotation: Fix::lit(rotation),
+            platform: Some(PlatformShape {
+                extents: FVec2::new(Fix::lit(half_width), Fix::lit("1.5")),
+                radius: Fix::lit("0.5"),
+                kind: PlatformKind::Normal,
+            }),
+            ..Spawn::BODY
+        });
+    }
 
     for tick in 0..600u64 {
         inputs.clear();
@@ -106,6 +131,7 @@ fn a_recorded_match_replays_to_the_same_checksum() {
                 sim.request_spawn(Spawn {
                     position: FVec2::new(offset / Fix::lit("7"), -offset / Fix::lit("3")),
                     owner: Some(PlayerId::new(n)),
+                    ..Spawn::BODY
                 });
             }
         }
@@ -114,6 +140,13 @@ fn a_recorded_match_replays_to_the_same_checksum() {
     }
 
     assert_eq!(sim.tick().get(), 600);
-    assert_eq!(sim.entity_count(), 48);
-    assert_eq!(sim.state_hash(), 11_755_374_171_786_398_137);
+    assert_eq!(sim.entity_count(), 50);
+
+    // Some bodies came to rest and some are still falling. Both matter: a
+    // checksum over a world where nothing landed would not be exercising the
+    // grounding code at all.
+    let grounded = sim.entities().filter(|(_, e)| e.grounded.is_some()).count();
+    assert_eq!(grounded, 12);
+
+    assert_eq!(sim.state_hash(), 4_840_407_387_883_898_819);
 }
