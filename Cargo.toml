@@ -1,0 +1,13 @@
+[package]
+name = "rmopl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+macroquad = "0.4"
+fixed = "1"
+slotmap = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
