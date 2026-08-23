@@ -45,11 +45,20 @@ pub const FIXED_DELTA_TIME: Fix = Fix::lit("1").strict_div(Fix::lit("120"));
 // code, not here; this module only records the values. The classification is
 // noted so the conversion is a deliberate decision rather than an accident:
 //
-//   per-tick deltas, need rescaling:  ACCEL_AIR, GRAVITY_ACCEL
-//   already scaled by delta time:     ACCEL_GROUND
-//   absolute limits, unaffected:      MAX_SPEED, GRAVITY_MAX_FALL_SPEED
-//   one-shot impulses, unaffected:    JUMP_STRENGTH, UNGROUND_NUDGE,
-//                                     JUMP_EXTRA_TELEPORT_FACTOR
+//   per-tick additions, halve:      ACCEL_AIR, GRAVITY_ACCEL, MIN_TURNSPEED
+//   per-tick multipliers, take the  SLIPPERINESS_ICE, SLIPPERINESS_DEFAULT
+//     square root, not the half:
+//   already scaled by delta time:   ACCEL_GROUND
+//   absolute limits, unaffected:    MAX_SPEED, GRAVITY_MAX_FALL_SPEED
+//   one-shot impulses, unaffected:  JUMP_STRENGTH, UNGROUND_NUDGE,
+//                                   JUMP_EXTRA_TELEPORT_FACTOR
+//
+// Halving is not universally right even within the first group. Air
+// acceleration also sets the air speed cap through its drag term, so halving it
+// alone moves that cap; the coefficient has to be re-derived rather than
+// scaled. Retained-speed multipliers compound, so applying 0.5 twice as often
+// is 0.25 per unit of real time, and the tick-rate-invariant value is its
+// square root.
 
 /// Horizontal speed cap while grounded.
 pub const MAX_SPEED: Fix = Fix::lit("19");
