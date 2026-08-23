@@ -17,6 +17,8 @@ use crate::constants::{MAX_PLAYERS, TICKS_PER_SECOND};
 use crate::ids::{EntityId, PlayerId, Tick};
 use crate::input::ActionState;
 use crate::math::{FVec2, Fix};
+use crate::platform::{Platform, PlatformShape};
+use crate::player_physics;
 
 // --- Random numbers --------------------------------------------------------
 
@@ -105,17 +107,65 @@ impl Pcg32 {
 
 /// A thing in the world.
 ///
-/// Deliberately almost empty. Gravity, velocity and collision arrive in the
-/// phases that own them; what this phase needs is something real to insert,
-/// order and hash, so that the ordering guarantees are tested rather than
-/// asserted.
+/// One type for every kind of entity, bodies and platforms alike. Nesting a
+/// separate body struct inside this one would buy nothing while the
+/// relationship is one to one, and splitting it out is a cheap refactor on the
+/// day a second kind of entity needs different fields.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Entity {
     pub position: FVec2,
+    /// The body's own movement: walking, and jumps.
+    ///
+    /// Kept separate from [`Entity::external_velocity`] permanently. The two
+    /// decay differently, and an ability that needs to know whether a body
+    /// jumped or was thrown cannot recover that from a single summed vector.
+    pub self_imposed_velocity: FVec2,
+    /// Knockback and explosions. Written by the collision phase; zero until
+    /// then, and deliberately not merged into the channel above.
+    pub external_velocity: FVec2,
+    pub rotation: Fix,
+    pub scale: Fix,
     /// The player this belongs to, if any. Scenery and projectiles owned by
     /// nobody are normal, which is why this is an `Option` rather than a
     /// reserved id value.
     pub owner: Option<PlayerId>,
+    /// Set when this entity is a platform rather than a body.
+    ///
+    /// Platforms live in the same slotmap as everything else, which hands them
+    /// stable generational ids, a deterministic iteration order and destruction
+    /// for nothing. Grounded state has to name a platform by [`EntityId`]
+    /// anyway.
+    pub shape: Option<PlatformShape>,
+    /// Set while this body is standing on a platform.
+    pub grounded: Option<Grounded>,
+}
+
+impl Entity {
+    /// The platform this entity is, if it is one.
+    ///
+    /// Built from the entity's own position and rotation rather than stored, so
+    /// there is exactly one source of truth for where a platform sits. Storing
+    /// a centre twice is how a moving platform ends up drawn in one place and
+    /// collided with in another.
+    pub fn platform(&self) -> Option<Platform> {
+        self.shape
+            .map(|shape| Platform::new(self.position, self.rotation, shape))
+    }
+}
+
+/// A body standing on a platform.
+///
+/// The position along the surface is a **scalar fraction of the platform's
+/// perimeter**, not a pair of coordinates, and the world position is derived
+/// from it every tick. Coordinates work perfectly for a flat top face and then
+/// have to be thrown away when bodies start walking round corners, taking every
+/// call site with them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Grounded {
+    pub platform: EntityId,
+    /// Distance around the platform's perimeter, in `0..1`. See
+    /// [`Platform::top_face_end`] for which part of that range is the top face.
+    pub local_pos: Fix,
 }
 
 /// A request to put something in the world, honoured at the start of the next
@@ -127,10 +177,46 @@ pub struct Entity {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Spawn {
     pub position: FVec2,
+    pub self_imposed_velocity: FVec2,
+    pub rotation: Fix,
+    pub scale: Fix,
     pub owner: Option<PlayerId>,
+    /// Present when what is being spawned is a platform. Its centre and
+    /// rotation come from `position` and `rotation` above, so there is only
+    /// ever one place either is written.
+    pub platform: Option<PlatformShape>,
 }
 
+/// Every field of a [`Spawn`], as raw bits, in a fixed order.
+///
+/// A named alias rather than an inline tuple only because it is long; the
+/// meaning is exactly what it looks like.
+type SpawnKey = (
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    Option<(i64, i64, i64, u8)>,
+    Option<PlayerId>,
+);
+
 impl Spawn {
+    /// A motionless, unrotated, unowned body at the origin.
+    ///
+    /// Exists so that `Spawn { position, ..Spawn::BODY }` stays readable as the
+    /// struct grows, and so that a new field gets a considered default in one
+    /// place instead of at every call site.
+    pub const BODY: Self = Self {
+        position: FVec2::ZERO,
+        self_imposed_velocity: FVec2::ZERO,
+        rotation: Fix::ZERO,
+        scale: Fix::ONE,
+        owner: None,
+        platform: None,
+    };
+
     /// The key insertion is ordered by: every field, in a fixed order,
     /// compared as raw bits.
     ///
@@ -152,10 +238,25 @@ impl Spawn {
     ///
     /// `Option` orders `None` before `Some`, so an unowned spawn and one owned
     /// by player zero are distinct here rather than needing a sentinel.
-    fn order_key(&self) -> (i64, i64, Option<PlayerId>) {
+    /// Every deterministic field appears here. A field left out would make two
+    /// spawns that differ only in it compare equal, and the sort would then
+    /// treat them as interchangeable when they are not.
+    fn order_key(&self) -> SpawnKey {
         (
             self.position.x.to_bits(),
             self.position.y.to_bits(),
+            self.self_imposed_velocity.x.to_bits(),
+            self.self_imposed_velocity.y.to_bits(),
+            self.rotation.to_bits(),
+            self.scale.to_bits(),
+            self.platform.map(|shape| {
+                (
+                    shape.extents.x.to_bits(),
+                    shape.extents.y.to_bits(),
+                    shape.radius.to_bits(),
+                    shape.kind.tag(),
+                )
+            }),
             self.owner,
         )
     }
@@ -233,7 +334,8 @@ impl Sim {
 
         // 4. Per-entity simulation update. Phase 03 onwards.
 
-        // 5. Physics. Phase 03 onwards.
+        // 5. Physics: gravity, the ground raycasts, and grounding.
+        player_physics::step(&mut self.entities);
 
         // 6. Per-entity late update, after physics has moved everything.
 
@@ -264,7 +366,13 @@ impl Sim {
         for spawn in self.pending.drain(..) {
             self.entities.insert(Entity {
                 position: spawn.position,
+                self_imposed_velocity: spawn.self_imposed_velocity,
+                external_velocity: FVec2::ZERO,
+                rotation: spawn.rotation,
+                scale: spawn.scale,
                 owner: spawn.owner,
+                shape: spawn.platform,
+                grounded: None,
             });
         }
     }
@@ -315,12 +423,7 @@ impl Sim {
 
         for (id, entity) in self.entities.iter() {
             words.push(slotmap::Key::data(&id).as_ffi());
-            words.push(entity.position.x.to_bits() as u64);
-            words.push(entity.position.y.to_bits() as u64);
-            words.push(match entity.owner {
-                None => u64::MAX,
-                Some(player) => u64::from(player.raw()),
-            });
+            entity_words(entity, &mut words);
         }
 
         for (player, action) in &self.inputs {
@@ -339,6 +442,55 @@ impl Sim {
 
         fnv1a(&words)
     }
+}
+
+/// Every deterministic field of an entity, as raw bits.
+///
+/// Split out from [`Sim::state_hash`] so a test can assert, field by field,
+/// that changing one changes the words. A field that is part of simulation
+/// state but missing from here is a desync nobody can see until two machines
+/// have already disagreed for a minute.
+///
+/// Optional fields contribute a fixed number of words whether they are present
+/// or not, so the word stream of an entity carrying a platform can never
+/// coincide with that of one that does not.
+fn entity_words(entity: &Entity, words: &mut Vec<u64>) {
+    let bits = |v: Fix| v.to_bits() as u64;
+
+    words.extend_from_slice(&[
+        bits(entity.position.x),
+        bits(entity.position.y),
+        bits(entity.self_imposed_velocity.x),
+        bits(entity.self_imposed_velocity.y),
+        bits(entity.external_velocity.x),
+        bits(entity.external_velocity.y),
+        bits(entity.rotation),
+        bits(entity.scale),
+        match entity.owner {
+            None => u64::MAX,
+            Some(player) => u64::from(player.raw()),
+        },
+    ]);
+
+    words.extend_from_slice(&match entity.shape {
+        None => [0; 5],
+        Some(shape) => [
+            1,
+            bits(shape.extents.x),
+            bits(shape.extents.y),
+            bits(shape.radius),
+            u64::from(shape.kind.tag()),
+        ],
+    });
+
+    words.extend_from_slice(&match entity.grounded {
+        None => [0; 3],
+        Some(grounded) => [
+            1,
+            slotmap::Key::data(&grounded.platform).as_ffi(),
+            bits(grounded.local_pos),
+        ],
+    });
 }
 
 /// FNV-1a over 64-bit words.
@@ -455,11 +607,12 @@ mod tests {
     use super::*;
     use crate::input::ActionState;
     use crate::math::FVec2;
+    use crate::platform::{PlatformKind, PlatformShape};
 
     fn spawn_at(x: &str, y: &str) -> Spawn {
         Spawn {
             position: FVec2::new(Fix::lit(x), Fix::lit(y)),
-            owner: None,
+            ..Spawn::BODY
         }
     }
 
@@ -556,8 +709,8 @@ mod tests {
             spawn_at("0", "0"),
             spawn_at("97.25", "-11.5"),
             Spawn {
-                position: FVec2::ZERO,
                 owner: Some(PlayerId::new(0)),
+                ..Spawn::BODY
             },
         ];
 
@@ -585,11 +738,17 @@ mod tests {
     /// Two spawns share an ordering key only when they are equal in every
     /// field. A hash could not promise this, and a collision between distinct
     /// spawns would silently hand the tie back to arrival order.
+    ///
+    /// There is one variant per field, and each differs from the base by a
+    /// single raw unit wherever it can. A field left out of the key shows up
+    /// here as two variants comparing equal.
     #[test]
     fn only_identical_spawns_share_an_ordering_key() {
-        let base = Spawn {
-            position: FVec2::ZERO,
-            owner: None,
+        let base = Spawn::BODY;
+        let a_shape = PlatformShape {
+            extents: FVec2::ONE,
+            radius: Fix::ONE,
+            kind: PlatformKind::Normal,
         };
         let variants = [
             base,
@@ -611,6 +770,54 @@ mod tests {
             },
             Spawn {
                 position: FVec2::new(Fix::from_bits(-1), Fix::ZERO),
+                ..base
+            },
+            Spawn {
+                self_imposed_velocity: FVec2::new(Fix::from_bits(1), Fix::ZERO),
+                ..base
+            },
+            Spawn {
+                self_imposed_velocity: FVec2::new(Fix::ZERO, Fix::from_bits(1)),
+                ..base
+            },
+            Spawn {
+                rotation: Fix::from_bits(1),
+                ..base
+            },
+            Spawn {
+                scale: Fix::ONE + Fix::from_bits(1),
+                ..base
+            },
+            Spawn {
+                platform: Some(a_shape),
+                ..base
+            },
+            Spawn {
+                platform: Some(PlatformShape {
+                    extents: FVec2::new(Fix::ONE + Fix::from_bits(1), Fix::ONE),
+                    ..a_shape
+                }),
+                ..base
+            },
+            Spawn {
+                platform: Some(PlatformShape {
+                    extents: FVec2::new(Fix::ONE, Fix::ONE + Fix::from_bits(1)),
+                    ..a_shape
+                }),
+                ..base
+            },
+            Spawn {
+                platform: Some(PlatformShape {
+                    radius: Fix::ONE + Fix::from_bits(1),
+                    ..a_shape
+                }),
+                ..base
+            },
+            Spawn {
+                platform: Some(PlatformShape {
+                    kind: PlatformKind::Ice,
+                    ..a_shape
+                }),
                 ..base
             },
         ];
@@ -640,8 +847,21 @@ mod tests {
             spawn_at("0", "0"),
             spawn_at("3.25", "0"),
             Spawn {
-                position: FVec2::ZERO,
                 owner: Some(PlayerId::new(2)),
+                ..Spawn::BODY
+            },
+            Spawn {
+                self_imposed_velocity: FVec2::new(Fix::lit("-3"), Fix::lit("8")),
+                rotation: Fix::lit("0.5"),
+                ..Spawn::BODY
+            },
+            Spawn {
+                platform: Some(PlatformShape {
+                    extents: FVec2::new(Fix::lit("4"), Fix::lit("1")),
+                    radius: Fix::lit("0.5"),
+                    kind: PlatformKind::Ice,
+                }),
+                ..Spawn::BODY
             },
         ];
 
@@ -658,6 +878,194 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every deterministic field of an entity must reach the checksum. A field
+    /// that is part of simulation state but missing from the hash is a desync
+    /// two peers cannot see: their worlds differ and their checksums agree.
+    ///
+    /// One variant per field, each differing from the base by the smallest
+    /// change that field can express. A field left out of `entity_words` shows
+    /// up as two variants producing identical words.
+    #[test]
+    fn every_entity_field_reaches_the_checksum() {
+        let base = Entity {
+            position: FVec2::ZERO,
+            self_imposed_velocity: FVec2::ZERO,
+            external_velocity: FVec2::ZERO,
+            rotation: Fix::ZERO,
+            scale: Fix::ONE,
+            owner: None,
+            shape: None,
+            grounded: None,
+        };
+        let a_shape = PlatformShape {
+            extents: FVec2::ONE,
+            radius: Fix::ONE,
+            kind: PlatformKind::Normal,
+        };
+        let a_key = {
+            let mut map: SlotMap<EntityId, Entity> = SlotMap::with_key();
+            map.insert(base)
+        };
+        let one = Fix::from_bits(1);
+
+        let variants = [
+            base,
+            Entity {
+                position: FVec2::new(one, Fix::ZERO),
+                ..base
+            },
+            Entity {
+                position: FVec2::new(Fix::ZERO, one),
+                ..base
+            },
+            Entity {
+                self_imposed_velocity: FVec2::new(one, Fix::ZERO),
+                ..base
+            },
+            Entity {
+                self_imposed_velocity: FVec2::new(Fix::ZERO, one),
+                ..base
+            },
+            Entity {
+                external_velocity: FVec2::new(one, Fix::ZERO),
+                ..base
+            },
+            Entity {
+                external_velocity: FVec2::new(Fix::ZERO, one),
+                ..base
+            },
+            Entity {
+                rotation: one,
+                ..base
+            },
+            Entity {
+                scale: Fix::ONE + one,
+                ..base
+            },
+            Entity {
+                owner: Some(PlayerId::new(0)),
+                ..base
+            },
+            Entity {
+                owner: Some(PlayerId::new(1)),
+                ..base
+            },
+            Entity {
+                shape: Some(a_shape),
+                ..base
+            },
+            Entity {
+                shape: Some(PlatformShape {
+                    extents: FVec2::new(Fix::ONE + one, Fix::ONE),
+                    ..a_shape
+                }),
+                ..base
+            },
+            Entity {
+                shape: Some(PlatformShape {
+                    extents: FVec2::new(Fix::ONE, Fix::ONE + one),
+                    ..a_shape
+                }),
+                ..base
+            },
+            Entity {
+                shape: Some(PlatformShape {
+                    radius: Fix::ONE + one,
+                    ..a_shape
+                }),
+                ..base
+            },
+            Entity {
+                shape: Some(PlatformShape {
+                    kind: PlatformKind::Ice,
+                    ..a_shape
+                }),
+                ..base
+            },
+            Entity {
+                grounded: Some(Grounded {
+                    platform: a_key,
+                    local_pos: Fix::ZERO,
+                }),
+                ..base
+            },
+            Entity {
+                grounded: Some(Grounded {
+                    platform: a_key,
+                    local_pos: one,
+                }),
+                ..base
+            },
+        ];
+
+        let words = |entity: &Entity| {
+            let mut out = Vec::new();
+            entity_words(entity, &mut out);
+            out
+        };
+
+        for (i, a) in variants.iter().enumerate() {
+            for (j, b) in variants.iter().enumerate() {
+                assert_eq!(
+                    words(a) == words(b),
+                    i == j,
+                    "variants {i} and {j} hash the same"
+                );
+            }
+        }
+    }
+
+    /// An entity carrying a platform contributes the same number of words as
+    /// one that does not, so no arrangement of entities can make two different
+    /// worlds produce the same stream of words.
+    #[test]
+    fn an_entity_contributes_a_fixed_number_of_words() {
+        let mut plain = Vec::new();
+        entity_words(
+            &Entity {
+                position: FVec2::ZERO,
+                self_imposed_velocity: FVec2::ZERO,
+                external_velocity: FVec2::ZERO,
+                rotation: Fix::ZERO,
+                scale: Fix::ONE,
+                owner: None,
+                shape: None,
+                grounded: None,
+            },
+            &mut plain,
+        );
+
+        let mut world = Sim::new(1);
+        world.request_spawn(Spawn {
+            platform: Some(PlatformShape {
+                extents: FVec2::ONE,
+                radius: Fix::ONE,
+                kind: PlatformKind::Ice,
+            }),
+            ..Spawn::BODY
+        });
+        world.step(&[]);
+
+        let mut furnished = Vec::new();
+        let (_, entity) = world.entities().next().expect("the platform");
+        entity_words(entity, &mut furnished);
+
+        assert_eq!(plain.len(), furnished.len());
+    }
+
+    /// The checksum has to actually move when the world does. Gravity alone is
+    /// enough to prove it: an entity that fell is not where it was.
+    #[test]
+    fn the_checksum_follows_a_falling_body() {
+        let mut sim = Sim::new(5);
+        sim.request_spawn(spawn_at("0", "0"));
+        sim.step(&[]);
+
+        let resting = sim.state_hash();
+        sim.step(&[]);
+        assert_ne!(sim.state_hash(), resting, "the body should have fallen");
     }
 
     #[test]
@@ -691,6 +1099,90 @@ mod tests {
         sim.step(&[]);
         assert_eq!(sim.tick(), Tick::new(4));
         assert_eq!(sim.entity_count(), 1, "the spawn survived the freeze");
+    }
+
+    /// Hit-stop freezes physics too, and still costs exactly one tick. A tick
+    /// that advanced the world without advancing the counter, or the reverse,
+    /// would slide every later tick's inputs one slot over once the netcode
+    /// indexes them by tick number.
+    #[test]
+    fn hitstop_holds_a_falling_body_still_without_skipping_a_tick() {
+        let mut sim = Sim::new(3);
+        sim.request_spawn(spawn_at("0", "10"));
+        sim.step(&[]);
+
+        let (id, _) = sim.entities().next().expect("the body");
+        let dropped_from = sim.entity(id).expect("still there").position;
+
+        sim.apply_hitstop(4);
+        for expected in 2..=5u64 {
+            sim.step(&[]);
+            assert_eq!(sim.tick(), Tick::new(expected));
+            assert_eq!(
+                sim.entity(id).expect("still there").position,
+                dropped_from,
+                "the world is on hold"
+            );
+        }
+
+        sim.step(&[]);
+        assert!(sim.entity(id).expect("still there").position.y < dropped_from.y);
+    }
+
+    /// The phase, through the public API: a body falls, lands, and stays.
+    #[test]
+    fn a_body_falls_onto_a_platform_and_stays_there() {
+        let mut sim = Sim::new(0xf00d);
+        sim.request_spawn(Spawn {
+            position: FVec2::new(Fix::ZERO, Fix::lit("-10")),
+            platform: Some(PlatformShape {
+                extents: FVec2::new(Fix::lit("10"), Fix::lit("1")),
+                radius: Fix::lit("0.5"),
+                kind: PlatformKind::Normal,
+            }),
+            ..Spawn::BODY
+        });
+        sim.request_spawn(Spawn {
+            position: FVec2::new(Fix::lit("2"), Fix::lit("10")),
+            owner: Some(PlayerId::new(1)),
+            ..Spawn::BODY
+        });
+
+        for _ in 0..300 {
+            sim.step(&[]);
+        }
+
+        let body = sim
+            .entities()
+            .find(|(_, e)| e.owner == Some(PlayerId::new(1)))
+            .map(|(_, e)| *e)
+            .expect("the body");
+
+        let grounded = body.grounded.expect("should have landed");
+        assert_eq!(body.self_imposed_velocity, FVec2::ZERO);
+        assert_eq!(
+            body.external_velocity,
+            FVec2::ZERO,
+            "nothing writes this yet"
+        );
+
+        // Resting on the top face, one radius above it.
+        let surface = Fix::lit("-10") + Fix::lit("1") + Fix::lit("0.5");
+        let expected = surface + crate::constants::RADIUS;
+        assert!((body.position.y - expected).abs() < Fix::lit("0.00001"));
+        assert!(grounded.local_pos > Fix::ZERO && grounded.local_pos < Fix::ONE);
+
+        // And it is still there a hundred ticks later.
+        let settled = body.position;
+        for _ in 0..100 {
+            sim.step(&[]);
+        }
+        let still = sim
+            .entities()
+            .find(|(_, e)| e.owner == Some(PlayerId::new(1)))
+            .map(|(_, e)| *e)
+            .expect("the body");
+        assert_eq!(still.position, settled);
     }
 
     /// Two overlapping hits should not stack into a much longer freeze.
