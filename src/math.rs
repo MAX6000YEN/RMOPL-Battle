@@ -48,7 +48,35 @@ pub fn cos(radians: Fix) -> Fix {
 }
 
 /// Angle in radians from the positive x-axis to `(x, y)`, in -PI..=PI.
+///
+/// A vector pointing very nearly straight up or straight down is answered
+/// directly rather than by CORDIC. The underlying routine forms `y / x`, and
+/// once `x` is small enough that quotient does not fit in Q32.32 and the
+/// division panics — taking the whole simulation with it. That is not a corner
+/// case: a stick held straight up, a wall's surface normal and a vertical
+/// knockback all land there, and all three are ordinary gameplay.
+///
+/// The cutoff is chosen so the shortcut costs nothing measurable. At a ratio of
+/// 2^30 the true angle is within about four raw units of a right angle, which
+/// is well inside [`TRIG_ERROR_BOUND`] — no caller can distinguish the two
+/// answers, and the panic is gone.
 pub fn atan2(y: Fix, x: Fix) -> Fix {
+    /// How much taller than wide a vector must be to count as vertical.
+    const VERTICAL_RATIO: i128 = 1 << 30;
+
+    let tall = i128::from(y.to_bits()).abs();
+    let wide = i128::from(x.to_bits()).abs();
+
+    if wide == 0 || tall > wide * VERTICAL_RATIO {
+        // At this ratio the sign of x no longer affects the answer to within
+        // the error bound, so only the direction of y matters.
+        return if y < Fix::ZERO {
+            -Fix::FRAC_PI_2
+        } else {
+            Fix::FRAC_PI_2
+        };
+    }
+
     cordic::atan2(y, x)
 }
 
@@ -367,5 +395,47 @@ mod tests {
 
         assert_eq!(a - b, a + (-b));
         assert_eq!((a * s) / s, a);
+    }
+
+    /// A near-vertical vector used to take the whole simulation down: the
+    /// CORDIC routine forms `y / x` and that quotient does not fit in Q32.32
+    /// once `x` is small enough. A stick held straight up produces exactly
+    /// this, so it is ordinary input rather than a corner case.
+    #[test]
+    fn atan2_survives_vectors_that_are_almost_vertical() {
+        let tall = Fix::ONE;
+        for wide in [
+            Fix::from_bits(1),
+            Fix::from_bits(-1),
+            Fix::from_bits(7),
+            Fix::lit("0.0000000007"),
+            Fix::lit("-0.0000000007"),
+            Fix::ZERO,
+        ] {
+            let up = atan2(tall, wide);
+            let down = atan2(-tall, wide);
+            assert!(
+                (up - Fix::FRAC_PI_2).abs().to_bits() <= TRIG_ERROR_BOUND,
+                "up was {up} for x = {wide}"
+            );
+            assert!(
+                (down + Fix::FRAC_PI_2).abs().to_bits() <= TRIG_ERROR_BOUND,
+                "down was {down} for x = {wide}"
+            );
+        }
+    }
+
+    /// The shortcut must not disturb angles that were never in danger.
+    #[test]
+    fn atan2_is_unchanged_away_from_the_vertical() {
+        assert_eq!(atan2(Fix::ONE, Fix::ONE), cordic::atan2(Fix::ONE, Fix::ONE));
+        assert_eq!(
+            atan2(Fix::ONE, Fix::lit("-0.001")),
+            cordic::atan2(Fix::ONE, Fix::lit("-0.001"))
+        );
+        assert_eq!(
+            atan2(Fix::lit("-3"), Fix::lit("4")),
+            cordic::atan2(Fix::lit("-3"), Fix::lit("4"))
+        );
     }
 }
