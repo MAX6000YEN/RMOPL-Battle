@@ -51,6 +51,37 @@ do not build them.
 
 ---
 
+## Phase 02 API — what exists today
+
+- **`ids`** — `PeerId(u16)`, `PlayerId(u8)`, `DeviceId(u32)`, `Tick(u64)` and `EntityId` (a slotmap
+  key). No conversions between them, by construction; the module's doctests are compile-fail cases
+  proving so. `Player { id, peer, device: Option<DeviceId>, entity: Option<EntityId> }` and
+  `Roster`, which keeps players sorted by id and can answer `of_peer`.
+- **`input::ActionState`** — one stick and six buttons; the whole game's input and the wire format.
+  `with_stick` applies `INPUT_DEADZONE` and quantises to a byte of angle plus a byte of magnitude.
+  `KEYBOARD_BINDINGS` and `poll_keyboard` cover two keyboard players.
+- **`sim::Sim`** — `new(seed)`, `step(&[(PlayerId, ActionState)])`, `request_spawn`, `state_hash`,
+  and read-only accessors. `Pcg32`, `Spawn`, `Entity`.
+- **`sim::Accumulator`** — `ticks_due(frame_nanos)` and `alpha()`. Driver-side, not simulation
+  state.
+
+### Rules this phase established that later phases inherit
+
+- **`Sim::step` is the only mutation path**, and it reads nothing but its arguments. Anything that
+  wants to change the world does it from inside a tick.
+- **Inputs are sorted inside `step`**, so the caller may hand them over in arrival order.
+- **Spawn ordering keys are derived from the spawn's contents**, never from a counter or from
+  arrival order. A counter would decide entity ids before the sort ran, so two peers that generated
+  the same spawns in a different order would build different worlds and the sort would not save
+  them.
+- **Hit-stop freezes the world but still advances the tick**, so the tick count and the number of
+  `step` calls never come apart. The netcode indexes inputs by tick.
+- **The action set carries a magnitude byte that nothing reads yet.** It is reserved rather than
+  used: adding it after the netcode ships would mean changing the wire format on every peer at once.
+- **`ActionState` stays ability-agnostic and three bytes.** Every bandwidth figure scales with it.
+- **`MAX_TICKS_PER_FRAME` bounds catch-up.** A stalled machine runs briefly in slow motion instead
+  of spiralling.
+
 ## Phase 01 API — what exists today
 
 - **`math::Fix`** — `fixed::types::I32F32`. Build constants with `Fix::lit("1.6")`, which is const
@@ -65,6 +96,9 @@ do not build them.
 
 ### Accuracy facts you must not rediscover the hard way
 
+- `atan2` answers a near-vertical vector directly rather than through CORDIC, which would form
+  `y / x` and panic on overflow once `x` is small. A stick held straight up hits this, so it is
+  ordinary input, not a corner case. Fixed at the root in `math::atan2`; call sites need no guard.
 - `sin` and `cos` are within **32 raw units** (`math::TRIG_ERROR_BOUND`) of the true value and may
   land up to **2 raw units outside -1..=1**. Anything feeding one into `acos`, `sqrt(1 - x^2)` or a
   similar domain-restricted operation **must clamp at that call site**. There is deliberately no
