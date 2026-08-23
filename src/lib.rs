@@ -4,4 +4,7 @@
 //! Rendering may use floats; nothing that feeds the simulation may.
 
 pub mod constants;
+pub mod ids;
+pub mod input;
 pub mod math;
+pub mod sim;

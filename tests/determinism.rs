@@ -58,3 +58,60 @@ fn sqrt_is_bit_stable() {
     }
     assert_eq!(bits, 3_788_800_590_183_152_348);
 }
+
+/// A recorded match, replayed to a single number.
+///
+/// This is the seed of the determinism harness. It is not testing that the
+/// simulation does anything interesting — it does almost nothing yet — but that
+/// a fixed seed and a fixed input sequence produce the same bits on Linux and
+/// on macOS, which is the property the netcode is built on. CI runs it on both,
+/// which is what makes the pinned number below mean something.
+///
+/// If this value changes, something changed the meaning of a tick. That is
+/// sometimes intentional, and it is never something to update without knowing
+/// why.
+#[test]
+fn a_recorded_match_replays_to_the_same_checksum() {
+    use rmopl::ids::PlayerId;
+    use rmopl::input::ActionState;
+    use rmopl::sim::{Sim, Spawn};
+
+    let mut sim = Sim::new(0x1234_5678_9abc_def0);
+    let mut inputs = Vec::new();
+
+    for tick in 0..600u64 {
+        inputs.clear();
+        for n in 1..=8u8 {
+            let angle = Fix::from_num(((tick * 7 + u64::from(n) * 13) % 360) as i32);
+            let radians = angle * Fix::PI / Fix::lit("180");
+            let action = ActionState {
+                jump: (tick + u64::from(n)) % 11 == 0,
+                ab1: tick % 5 == 0,
+                ab2: n % 3 == 0,
+                start: false,
+                select: tick == 300,
+                ..ActionState::NEUTRAL
+            }
+            .with_stick(FVec2::new(cos(radians), sin(radians)));
+            inputs.push((PlayerId::new(n), action));
+        }
+
+        // Spawn requests are made in an order that changes tick to tick; the
+        // resulting world must not.
+        if tick % 50 == 0 {
+            for n in 0..4u8 {
+                let offset = Fix::from_num(i32::from((tick as u8).wrapping_add(n)));
+                sim.request_spawn(Spawn {
+                    position: FVec2::new(offset / Fix::lit("7"), -offset / Fix::lit("3")),
+                    owner: Some(PlayerId::new(n)),
+                });
+            }
+        }
+
+        sim.step(&inputs);
+    }
+
+    assert_eq!(sim.tick().get(), 600);
+    assert_eq!(sim.entity_count(), 48);
+    assert_eq!(sim.state_hash(), 2_864_514_947_282_321_901);
+}
