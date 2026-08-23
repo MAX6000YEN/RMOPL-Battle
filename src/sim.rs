@@ -226,7 +226,7 @@ impl Sim {
         // 1. Players act on their inputs.
         //    Movement is Phase 04; for now inputs are recorded and no more.
 
-        // 2. Insert everything spawned last tick, in a content-derived order.
+        // 2. Insert everything spawned last tick, ordered by their fields.
         self.insert_pending();
 
         // 3. Remove destroyed entities. Nothing destroys anything yet.
