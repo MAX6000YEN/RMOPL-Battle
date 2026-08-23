@@ -8,6 +8,7 @@ rust-version = "1.98"
 macroquad = "0.4.16"
 fixed = "1.31"
 slotmap = "1.1"
+cordic = "0.1.5"
 
 [profile.release]
 opt-level = 3
