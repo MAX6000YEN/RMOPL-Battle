@@ -17,6 +17,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Use the current stable toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustc --version && cargo clippy --version && rustfmt --version
+
       - name: Install graphics and audio headers
         if: runner.os == 'Linux'
         run: |
