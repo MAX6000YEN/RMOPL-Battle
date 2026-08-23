@@ -45,7 +45,8 @@ pub const FIXED_DELTA_TIME: Fix = Fix::lit("1").strict_div(Fix::lit("120"));
 // code, not here; this module only records the values. The classification is
 // noted so the conversion is a deliberate decision rather than an accident:
 //
-//   per-tick additions, halve:      ACCEL_AIR, GRAVITY_ACCEL, MIN_TURNSPEED
+//   per-tick additions, halve:      ACCEL_AIR, GRAVITY_ACCEL (converted),
+//                                   MIN_TURNSPEED
 //   per-tick multipliers, take the  SLIPPERINESS_ICE, SLIPPERINESS_DEFAULT
 //     square root, not the half:
 //   already scaled by delta time:   ACCEL_GROUND
@@ -71,7 +72,20 @@ pub const ACCEL_AIR: Fix = Fix::lit("10");
 /// Collision radius of a player.
 pub const RADIUS: Fix = Fix::lit("0.76");
 /// Downward acceleration, applied per tick.
-pub const GRAVITY_ACCEL: Fix = Fix::lit("1.6");
+///
+/// **Converted for the 120 Hz tick.** The tuned value was 1.6 against a 60 Hz
+/// tick, applied once per tick with no delta-time factor, so it is a per-tick
+/// addition rather than a rate: used unchanged at 120 Hz it would fire twice as
+/// often and fall twice as hard. Halving is the analytically correct conversion
+/// for this group.
+///
+/// The conversion is *not* guarded by the terminal-velocity test. The drag term
+/// is derived from this constant, so halving the acceleration halves the drag
+/// with it and the equilibrium `g == v * (g / v_max)` still solves to `v_max`
+/// for every `g`. What actually changes is how long the fall takes to get
+/// there, which is why `player_physics` pins the tick count and the distance
+/// fallen instead.
+pub const GRAVITY_ACCEL: Fix = Fix::lit("0.8");
 /// Terminal velocity; the gravity drag term is derived so falling settles here.
 pub const GRAVITY_MAX_FALL_SPEED: Fix = Fix::lit("27");
 /// Per-level gravity scale. One is normal gravity.
@@ -177,7 +191,10 @@ mod tests {
 
     #[test]
     fn tuning_constants_have_their_expected_bits() {
-        assert_eq!(GRAVITY_ACCEL.to_bits(), 6_871_947_674);
+        // Halved from the 1.6 tuned against a 60 Hz tick, which had
+        // 6_871_947_674 raw units. Halving is exact in binary.
+        assert_eq!(GRAVITY_ACCEL.to_bits(), 3_435_973_837);
+        assert_eq!(GRAVITY_ACCEL * Fix::lit("2"), Fix::lit("1.6"));
         assert_eq!(RADIUS.to_bits(), 3_264_175_145);
 
         // Whole numbers are exact, so scaling one stays exact.
@@ -198,7 +215,7 @@ mod tests {
         let drag = GRAVITY_ACCEL / GRAVITY_MAX_FALL_SPEED;
         assert!(drag > Fix::ZERO);
         assert!(drag < Fix::lit("0.1"));
-        assert_eq!(drag.to_bits(), 254_516_580);
+        assert_eq!(drag.to_bits(), 127_258_290);
     }
 
     #[test]
