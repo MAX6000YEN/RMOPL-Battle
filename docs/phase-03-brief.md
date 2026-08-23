@@ -104,10 +104,11 @@ still frame, and this overlay is the cheapest debugging in the project.
 - `Sim::step` is the only mutation path, and it reads nothing but its arguments. Gravity, raycasts
   and grounding all run inside a tick, in the numbered slots the tick order already reserves —
   physics is step 5, and the late update after it is step 6.
-- `Sim::request_spawn` queues; the entity appears at the start of the next tick. Ordering keys come
-  from the spawn's contents. **If `Spawn` grows fields, extend `sort_key` with them**, or two
-  spawns differing only in a new field will collide and be treated as interchangeable when they are
-  not.
+- `Sim::request_spawn` queues; the entity appears at the start of the next tick. `Spawn::order_key`
+  is a total order over the spawn's fields — not a hash, deliberately, because a hash collision
+  between distinct spawns would silently hand the tie back to arrival order. **If `Spawn` grows
+  fields, extend `order_key` with them**, or two spawns differing only in a new field compare equal
+  and get treated as interchangeable when they are not.
 - `Sim::state_hash` must cover every new field that is part of simulation state. A field left out is
   a desync the harness cannot see.
 - `ActionState` carries a stick angle, a reserved magnitude byte and six buttons. Nothing in this

@@ -70,10 +70,11 @@ do not build them.
 - **`Sim::step` is the only mutation path**, and it reads nothing but its arguments. Anything that
   wants to change the world does it from inside a tick.
 - **Inputs are sorted inside `step`**, so the caller may hand them over in arrival order.
-- **Spawn ordering keys are derived from the spawn's contents**, never from a counter or from
-  arrival order. A counter would decide entity ids before the sort ran, so two peers that generated
-  the same spawns in a different order would build different worlds and the sort would not save
-  them.
+- **Spawn ordering keys are a total order over the spawn's fields**, never a counter, an arrival
+  index, or a hash. A counter would decide entity ids before the sort ran, so two peers that
+  generated the same spawns in a different order would build different worlds. A hash is not
+  injective, so two distinct spawns could collide and hand the tie back to arrival order — the same
+  bug, hidden in the one case nobody thinks to test. Compare the fields themselves.
 - **Hit-stop freezes the world but still advances the tick**, so the tick count and the number of
   `step` calls never come apart. The netcode indexes inputs by tick.
 - **The action set carries a magnitude byte that nothing reads yet.** It is reserved rather than
