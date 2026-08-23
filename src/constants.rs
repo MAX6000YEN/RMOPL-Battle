@@ -54,12 +54,19 @@ pub const FIXED_DELTA_TIME: Fix = Fix::lit("1").strict_div(Fix::lit("120"));
 //   one-shot impulses, unaffected:  JUMP_STRENGTH, UNGROUND_NUDGE,
 //                                   JUMP_EXTRA_TELEPORT_FACTOR
 //
-// Halving is not universally right even within the first group. Air
-// acceleration also sets the air speed cap through its drag term, so halving it
-// alone moves that cap; the coefficient has to be re-derived rather than
-// scaled. Retained-speed multipliers compound, so applying 0.5 twice as often
-// is 0.25 per unit of real time, and the tick-rate-invariant value is its
-// square root.
+// Halving is not universally right even within the first group.
+//
+// Air acceleration is paired with a drag term of ACCEL_AIR / (MAX_SPEED +
+// ACCEL_AIR), and where the cap lands depends on the order the two are applied
+// in within one tick. Accelerate first and then apply the drag to the result,
+// and the equilibrium is exactly MAX_SPEED for *every* value of the
+// coefficient, so halving moves nothing. Apply the drag first and the
+// equilibrium is MAX_SPEED + ACCEL_AIR instead, and then halving does move it.
+// The hazard is the ordering, not the halving; an earlier note here had that
+// backwards.
+//
+// Retained-speed multipliers compound, so applying 0.5 twice as often is 0.25
+// per unit of real time, and the tick-rate-invariant value is its square root.
 
 /// Horizontal speed cap while grounded.
 pub const MAX_SPEED: Fix = Fix::lit("19");

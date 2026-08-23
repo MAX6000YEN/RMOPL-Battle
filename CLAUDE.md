@@ -51,6 +51,69 @@ do not build them.
 
 ---
 
+## Phase 03 API — what exists today
+
+- **`platform`** — `PlatformShape { extents, radius, kind }` is what a spawn carries;
+  `Platform { center, extents, radius, rotation, kind }` is what queries run against, built on
+  demand by `Entity::platform()` from the entity's own position and rotation so a centre is never
+  stored twice. `PlatformKind::{Normal, Ice}` with a stable `tag()`. **`extents` excludes the
+  corner radius.**
+  Queries: `right()`, `up()`, `to_local()`, `to_world()`, `normal_at()` (all eight zones),
+  `perimeter()`, `top_face_end()`, `surface_point()`, `top_face_local_pos()`,
+  `top_face_crossing()`, `top_face_point()`, `local_pos_of_top_x()`.
+- **`sim::Entity`** — `position`, `self_imposed_velocity`, `external_velocity`, `rotation`,
+  `scale`, `owner`, `shape`, `grounded`, plus `Entity::platform()`.
+- **`sim::Grounded { platform: EntityId, local_pos: Fix }`** — where a body is standing.
+- **`sim::Spawn`** — gained `self_imposed_velocity`, `rotation`, `scale`, `platform`. Use
+  `Spawn::BODY` as the base: `Spawn { position, ..Spawn::BODY }`.
+- **`player_physics`** — `add_gravity`, `velocity_based_raycasts` returning `GroundHit`,
+  `attach_to_ground`, `unground`, and `step`, which runs from tick slot 5.
+
+### Rules this phase established that later phases inherit
+
+- **Surface positions run clockwise from the left end of the top face.** The top face is segment
+  zero, spanning `[0, top_face_end()]`, so moving right along the ground increases the coordinate.
+  The other seven segments are Phase 05 and currently answer `None`.
+- **`local_pos` is a fraction of the platform's own perimeter**, and the body's centre is then
+  offset outward by `RADIUS` along the normal. That is not the only possible parameterisation:
+  walking round a corner means the centre traces a longer path than the surface does, so Phase 05
+  must either divide by a centre-path perimeter (`perimeter() + 2*PI*RADIUS`) or account for the
+  difference at the corners. On a flat face the two agree, which is why Phase 04 can ignore it.
+  **Phase 05 owns that decision.**
+- **Zone boundaries resolve in favour of the flat faces**, and a landing past the end of the flat
+  top attaches at the end. That is what stops `normal_at` and the landing query from disagreeing
+  about a body sitting exactly on a corner. It means a body can catch a ledge from up to one radius
+  past it; Phase 05 replaces that with the arc.
+- **Three ground rays, not one**, run `|v| * dt + RADIUS` from the body's centre and offset
+  `± RADIUS` perpendicular to the direction of travel. The extension by the radius is what makes a
+  body land when its underside touches rather than when its centre arrives. Ties resolve by
+  platform slotmap order, then centre ray, then the two offsets.
+- **A grounded platform can stop existing.** The lookup returns `Option` and is handled; the
+  generational key fails rather than addressing whatever took the slot. Never unwrap it.
+- **Optional fields hash to a fixed number of words** whether present or not, so no arrangement of
+  entities can make two different worlds produce the same word stream.
+- **An unrotated platform uses exact axis vectors** rather than CORDIC, which would leave every
+  landing on every axis-aligned platform a few raw units askew.
+
+### Accuracy facts you must not rediscover the hard way
+
+- **The terminal-velocity test does not guard the tick rate.** The drag term is derived from the
+  acceleration, so `g == v * (g / v_max)` solves to `v_max` for every `g`: the halved and unhalved
+  constants converge to the same limit and differ only in how long they take. The tests that guard
+  the conversion measure the approach — the tick a fraction of terminal is reached, and the distance
+  fallen — never the limit.
+- **Terminal velocity settles 27 raw units *below* `GRAVITY_MAX_FALL_SPEED`**, at tick 740, because
+  the last increments underflow the multiply. That is arithmetic, not tuning, and it is pinned
+  rather than snapped away.
+- **A grounded body's derived world position is about 7e-9 off** its landing position: turning a
+  distance along the perimeter into a fraction and back truncates. It does not accumulate. Assert
+  positions with a tolerance, not bit-exactly.
+- **`Fix::frac()` has floor semantics** — `frac(-1.25)` is `0.75` — so a surface position wraps into
+  `[0, 1)` correctly in both directions with no guard.
+- **A local/world round trip on a rotated platform is not exact.** The basis is a few raw units off
+  unit length and the error scales with distance from the centre. Unrotated platforms do round-trip
+  exactly.
+
 ## Phase 02 API — what exists today
 
 - **`ids`** — `PeerId(u16)`, `PlayerId(u8)`, `DeviceId(u32)`, `Tick(u64)` and `EntityId` (a slotmap
